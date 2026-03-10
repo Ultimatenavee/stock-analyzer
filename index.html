@@ -1,1143 +1,666 @@
-<!DOCTYPE html>
-<html lang="th">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stock Movement Analyzer</title>
+import React, { useState, useEffect, useMemo } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
+import { Download, AlertCircle, CheckCircle, Activity, ListFilter, Server, Users, Hash, Network, Search, Copy, Check, Trash2 } from 'lucide-react';
+
+
+export default function App() {
+  const [inputText, setInputText] = useState('');
+  const [data, setData] = useState([]);
+  const [activeTab, setActiveTab] = useState('all'); // 'all' or 'missing'
+  const [searchTerm, setSearchTerm] = useState('');
+  const [copiedIntf, setCopiedIntf] = useState(null);
+  const [copiedCidIntf, setCopiedCidIntf] = useState(null);
+
+  // ฟังก์ชันแยกแยะและวิเคราะห์ข้อมูล
+  const parseData = (rawText) => {
+    const lines = rawText.split('\n').filter(line => line.trim() !== '');
     
-    <!-- Libraries -->
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- SheetJS -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <!-- Chart.js Data Labels -->
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.0.0"></script>
-    <!-- FontAwesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <!-- Google Fonts -->
-    <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    // คำที่ต้องการละเว้น ไม่นำมาเป็นชื่อลูกค้า
+    const ignoreWords = ['term', 'ori', 'orig', 'singlehome', 'dualhome', 'primary', 'secondary', 'main', 'backup'];
+    const ignoreRegex = new RegExp(`\\b(${ignoreWords.join('|')})\\b`, 'gi');
 
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    fontFamily: {
-                        sans: ['Sarabun', 'sans-serif'],
-                    },
-                    colors: {
-                        primary: '#4f46e5', // Indigo 600
-                        secondary: '#64748b', // Slate 500
-                    }
-                }
-            }
+    const parsed = lines.map((line, index) => {
+      const raw = line.trim();
+      
+      // --- 1. ค้นหาและแยก Interface และ VLAN ---
+      let interfaceName = '-';
+      let vlan = '-';
+      const interfaceMatch = raw.match(/^([A-Za-z\-]+[\d\/]+)(?:\.(\d+))?/);
+      if (interfaceMatch) {
+        interfaceName = interfaceMatch[1];
+        if (interfaceMatch[2]) {
+          vlan = interfaceMatch[2]; // หมายเลข Subinterface/VLAN
         }
-    </script>
+      }
 
-    <style>
-        body {
-            background-color: #f1f5f9; /* Slate 100 */
+      // --- 2. ดึงเฉพาะข้อความที่อยู่ใน @@...@@ มาวิเคราะห์ต่อ ---
+      let descText = '';
+      const exactMatch = raw.match(/@@(.*?)@@/);
+      if (exactMatch) {
+        descText = exactMatch[1];
+      } else {
+        const fallbackMatch = raw.match(/@@(.*)/);
+        if (fallbackMatch) {
+          descText = fallbackMatch[1].replace(/@+$/, '');
+        } else {
+          // รองรับเคสที่ไม่มี @@ แต่มีรูปแบบสถานะ up/down ตามด้วย Description หรือมีการใช้งาน Subinterface (VLAN)
+          const standardDescMatch = raw.match(/^(?:[A-Za-z\-]+[\d\/]+(?:\.\d+)?)\s+(?:up|down|\*down|admin|standby)\s+(?:up|down|\*down|admin|standby)\s+(.+)$/i);
+          if (standardDescMatch && standardDescMatch[1].trim()) {
+            descText = standardDescMatch[1].trim();
+          } else if (vlan !== '-') {
+            descText = 'UNKNOWN_DESC'; // เก็บไว้เพื่อนับการใช้งาน VLAN
+          } else {
+            return null; // ข้าม Physical/Main Trunk Ports ที่ไม่มี @@ และไม่มี VLAN
+          }
         }
+      }
 
-        /* Modern Scrollbar */
-        ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-        ::-webkit-scrollbar-track {
-            background: transparent; 
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #cbd5e1; 
-            border-radius: 10px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: #94a3b8; 
-        }
+      // --- 3. กรอง Management / L2VPN / L3VPN / ตัวเลขล้วน ทิ้งไป ---
+      if (/MGM|L[23]VPN/i.test(descText) || /^\s*\d+\s*$/.test(descText.replace(/[_ ]/g, ''))) {
+        return null;
+      }
 
-        /* Dropdown Styling */
-        .filter-dropdown {
-            display: none;
-            position: absolute;
-            background-color: white;
-            min-width: 260px;
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-            z-index: 60;
-            border-radius: 0.75rem;
-            padding: 0.5rem;
-            max-height: 320px;
-            overflow-y: auto;
-            border: 1px solid #e2e8f0;
-            animation: fadeIn 0.2s ease-out;
-        }
+      let cleanName = descText.replace(/^[_ ]+|[_ ]+$/g, '').trim();
+      let customerName = cleanName;
+
+      // 1. ค้นหาและแยก Bandwidth
+      const bwMatches = [...cleanName.matchAll(/(?:(\d+(?:\.\d+)?)\/)?(\d+(?:\.\d+)?)([MG])/gi)];
+      let hasBw = false;
+      let bwM = 0;
+      let bwG = 0;
+      let originalBw = '';
+
+      if (bwMatches.length > 0) {
+        const lastMatch = bwMatches[bwMatches.length - 1];
+        const val = parseFloat(lastMatch[2]);
+        const unit = lastMatch[3].toUpperCase();
         
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(-10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .filter-dropdown.show {
-            display: block;
-        }
-
-        /* Glassmorphism for Sticky Header */
-        .glass-header {
-            background: rgba(255, 255, 255, 0.9);
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(226, 232, 240, 0.8);
-        }
-
-        .chart-container {
-            position: relative; 
-            height: 350px; 
-            width: 100%;
-        }
-
-        .animate-fade-in-up {
-            animation: fadeInUp 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-
-        @keyframes fadeInUp {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        /* Table Row Hover Gradient */
-        .table-row-hover:hover {
-            background-color: #f8fafc;
-        }
-
-        /* Print Styles */
-        @media print {
-            .glass-header, #navUploadBtn, #exportBtn, #printBtn, button, .filter-dropdown { display: none !important; }
-            body { background-color: white !important; }
-            .shadow-sm, .shadow-xl, .shadow-lg { box-shadow: none !important; border: 1px solid #e2e8f0 !important; }
-            .chart-container { page-break-inside: avoid; }
-            .container { max-width: 100% !important; padding: 0 !important; }
-        }
-    </style>
-</head>
-<body class="text-slate-800 antialiased selection:bg-indigo-100 selection:text-indigo-700">
-
-    <!-- Navbar -->
-    <nav class="glass-header sticky top-0 z-50 transition-all duration-300">
-        <div class="container mx-auto px-4 md:px-6 h-16 flex justify-between items-center">
-            <div class="flex items-center gap-3">
-                <div class="bg-indigo-600 text-white w-10 h-10 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-200">
-                    <i class="fa-solid fa-chart-pie text-lg"></i>
-                </div>
-                <div>
-                    <h1 class="text-lg font-bold text-slate-800 leading-tight">Stock Analyzer Pro</h1>
-                    <p class="text-xs text-slate-500 font-medium">Smart Analytics Dashboard</p>
-                </div>
-            </div>
-            
-            <div class="flex gap-3">
-                <button id="navUploadBtn" onclick="document.getElementById('fileInput').click()" 
-                    class="hidden bg-white border border-slate-200 hover:border-indigo-300 text-slate-600 hover:text-indigo-600 px-4 py-2 rounded-lg text-sm font-semibold transition-all shadow-sm flex items-center gap-2 group">
-                    <i class="fa-solid fa-cloud-arrow-up group-hover:-translate-y-0.5 transition-transform"></i> 
-                    <span>Import File</span>
-                </button>
-                <input type="file" id="fileInput" accept=".xlsx, .xls, .csv" class="hidden" onchange="handleFileUpload(event)">
-                
-                <button onclick="window.print()" 
-                    class="hidden bg-white border border-slate-200 hover:border-slate-300 text-slate-600 px-4 py-2 rounded-lg text-sm font-semibold transition-all shadow-sm flex items-center gap-2 active:scale-95" id="printBtn">
-                    <i class="fa-solid fa-print"></i> 
-                    <span class="hidden sm:inline">Print</span>
-                </button>
-
-                <button onclick="exportAll()" 
-                    class="hidden bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2 rounded-lg text-sm font-semibold transition-all shadow-md shadow-indigo-200 flex items-center gap-2 active:scale-95" id="exportBtn">
-                    <i class="fa-solid fa-file-export"></i> 
-                    <span>Export Report</span>
-                </button>
-            </div>
-        </div>
-    </nav>
-
-    <!-- Main Content -->
-    <div class="container mx-auto p-4 md:p-6 max-w-7xl" id="mainContent">
+        hasBw = true;
+        originalBw = lastMatch[0].toUpperCase();
         
-        <!-- Welcome Screen -->
-        <div id="welcomeScreen" class="flex flex-col items-center justify-center min-h-[75vh] text-center animate-fade-in-up">
-            <div class="bg-white p-12 rounded-3xl shadow-xl border border-slate-100 max-w-2xl w-full relative overflow-hidden">
-                <div class="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500"></div>
-                
-                <div class="w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-8 animate-bounce duration-[3000ms]">
-                    <i class="fa-solid fa-magnifying-glass-chart text-4xl text-indigo-600"></i>
-                </div>
-                
-                <h2 class="text-3xl md:text-4xl font-bold text-slate-800 mb-4 tracking-tight">Stock Data Analysis</h2>
-                <p class="text-slate-500 mb-10 text-lg leading-relaxed">
-                    อัปโหลดไฟล์ Excel ของคุณเพื่อเริ่มการวิเคราะห์<br>
-                    ระบบจะคัดกรอง From/To Sub และสรุปผลให้อัตโนมัติ
-                </p>
-                
-                <button onclick="document.getElementById('fileInput').click()" 
-                    class="group relative inline-flex items-center justify-center px-8 py-4 font-bold text-white transition-all duration-200 bg-indigo-600 font-lg rounded-full focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-600 hover:bg-indigo-700 shadow-lg shadow-indigo-200 hover:shadow-indigo-300 hover:-translate-y-1">
-                    <span class="mr-3 text-xl"><i class="fa-solid fa-folder-open"></i></span>
-                    เลือกไฟล์ Excel
-                </button>
+        if (unit === 'G') {
+          bwG = val;
+          bwM = val * 1000;
+        } else {
+          bwM = val;
+          bwG = val / 1000;
+        }
 
-                <div class="mt-8 flex justify-center gap-6 text-sm text-slate-400 font-medium">
-                    <span class="flex items-center gap-1.5"><i class="fa-solid fa-circle-check text-emerald-500"></i> .xlsx</span>
-                    <span class="flex items-center gap-1.5"><i class="fa-solid fa-circle-check text-emerald-500"></i> .xls</span>
-                    <span class="flex items-center gap-1.5"><i class="fa-solid fa-circle-check text-emerald-500"></i> .csv</span>
-                </div>
+        const lastIndex = customerName.lastIndexOf(lastMatch[0]);
+        if (lastIndex !== -1) {
+          customerName = customerName.substring(0, lastIndex) + customerName.substring(lastIndex + lastMatch[0].length);
+        }
+        customerName = customerName.replace(/\/+$/, '').replace(/^\/+/, '');
+      }
+
+      // 2. ค้นหาและแยก CID 
+      let cid = '-';
+      const explicitCidMatch = cleanName.match(/\(CID:\s*([A-Za-z]{2}-?\d{4,})[^)]*\)/i);
+      if (explicitCidMatch) {
+        cid = explicitCidMatch[1].toUpperCase();
+        customerName = customerName.replace(explicitCidMatch[0], ''); 
+      } else {
+        const cidMatch = cleanName.match(/[A-Za-z]{2}-?\d{4,}/i);
+        if (cidMatch) {
+          cid = cidMatch[0].toUpperCase();
+          customerName = customerName.replace(new RegExp(cidMatch[0], 'i'), ''); 
+        }
+      }
+
+      customerName = customerName.replace(/\[[^\]]+\]/g, '');
+      customerName = customerName.replace(ignoreRegex, '');
+      customerName = customerName.replace(/_+/g, '_').replace(/-+/g, '-').replace(/ +/g, ' ');
+      customerName = customerName.replace(/^[^a-zA-Z0-9ก-ฮ]+|[^a-zA-Z0-9ก-ฮ]+$/g, '').trim();
+
+      if (!customerName) customerName = 'UNKNOWN_CUSTOMER';
+
+      return {
+        id: `row-${Date.now()}-${index}`,
+        raw,
+        interfaceName,
+        vlan,
+        cleanName,
+        cid,
+        customerName,
+        shortName: customerName.length > 15 ? customerName.substring(0, 15) + '...' : customerName,
+        hasBw,
+        originalBw,
+        bwM,
+        bwG
+      };
+    }).filter(item => item !== null);
+
+    return parsed;
+  };
+
+  useEffect(() => {
+    handleAnalyze();
+  }, []);
+
+  const handleAnalyze = () => {
+    const parsed = parseData(inputText);
+    setData(parsed);
+    // รีเซ็ตสถานะการค้นหาและ Tab กลับเป็นค่าเริ่มต้น เพื่อให้แสดงข้อมูลใหม่ทั้งหมด
+    setActiveTab('all');
+    setSearchTerm('');
+    setCopiedIntf(null);
+    setCopiedCidIntf(null);
+  };
+
+  const handleClear = () => {
+    setInputText('');
+    setData([]);
+    setActiveTab('all');
+    setSearchTerm('');
+    setCopiedIntf(null);
+    setCopiedCidIntf(null);
+  };
+
+  const sortedData = useMemo(() => {
+    return [...data].sort((a, b) => {
+      if (a.hasBw && !b.hasBw) return -1;
+      if (!a.hasBw && b.hasBw) return 1;
+      return (b.bwM || 0) - (a.bwM || 0);
+    });
+  }, [data]);
+
+  const missingBwData = useMemo(() => {
+    return sortedData.filter(d => !d.hasBw);
+  }, [sortedData]);
+
+  // กรองข้อมูลตามคำค้นหา (Search Filter)
+  const displayData = useMemo(() => {
+    const baseData = activeTab === 'all' ? sortedData : missingBwData;
+    if (!searchTerm.trim()) return baseData;
+    
+    const lowerTerm = searchTerm.toLowerCase();
+    return baseData.filter(row => 
+      (row.interfaceName && row.interfaceName.toLowerCase().includes(lowerTerm)) ||
+      (row.vlan && row.vlan.toString().includes(lowerTerm)) ||
+      (row.cid && row.cid.toLowerCase().includes(lowerTerm)) ||
+      (row.customerName && row.customerName.toLowerCase().includes(lowerTerm)) ||
+      (row.raw && row.raw.toLowerCase().includes(lowerTerm)) ||
+      (row.originalBw && row.originalBw.toLowerCase().includes(lowerTerm))
+    );
+  }, [activeTab, sortedData, missingBwData, searchTerm]);
+
+  const chartData = useMemo(() => {
+    return sortedData.filter(d => d.hasBw).slice(0, 30);
+  }, [sortedData]);
+
+  const stats = useMemo(() => {
+    const total = data.length;
+    const withBw = data.filter(d => d.hasBw).length;
+    const missingBw = total - withBw;
+    const totalGbps = data.reduce((acc, curr) => acc + (curr.bwG || 0), 0);
+
+    return { total, withBw, missingBw, totalGbps: totalGbps.toFixed(2) };
+  }, [data]);
+
+      // ประมวลผลสรุปข้อมูลตามพอร์ต และเก็บรายการ VLAN
+  const interfaceSummary = useMemo(() => {
+    const summary = {};
+    sortedData.forEach(row => {
+      if (row.interfaceName !== '-' && row.hasBw) {
+        if (!summary[row.interfaceName]) {
+          summary[row.interfaceName] = { vlanCount: 0, totalBwG: 0, vlans: [], cids: [] };
+        }
+        summary[row.interfaceName].vlanCount += 1;
+        summary[row.interfaceName].totalBwG += row.bwG;
+        // เก็บรายชื่อ VLAN ที่ไม่ซ้ำซ้อน
+        if (row.vlan !== '-' && !summary[row.interfaceName].vlans.includes(row.vlan)) {
+          summary[row.interfaceName].vlans.push(row.vlan);
+        }
+        // เก็บรายชื่อ CID ที่ไม่ซ้ำซ้อน
+        if (row.cid !== '-' && !summary[row.interfaceName].cids.includes(row.cid)) {
+          summary[row.interfaceName].cids.push(row.cid);
+        }
+      }
+    });
+
+    return Object.entries(summary)
+      .map(([name, data]) => ({ 
+        name, 
+        ...data,
+        // เรียงลำดับตัวเลข VLAN จากน้อยไปมาก
+        vlans: data.vlans.sort((a, b) => parseInt(a) - parseInt(b)),
+        // เรียงลำดับ CID 
+        cids: data.cids.sort()
+      }))
+      .sort((a, b) => b.totalBwG - a.totalBwG);
+  }, [sortedData]);
+
+  const copyVlans = (intfName, vlans) => {
+    // จัด format เป็น 1 VLAN ต่อ 1 บรรทัด
+    const textToCopy = vlans.join('\n');
+    
+    // ใช้เทคนิค textarea เพื่อให้รองรับการ Copy ภายใน iFrame 
+    const textArea = document.createElement("textarea");
+    textArea.value = textToCopy;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      setCopiedIntf(intfName);
+      setTimeout(() => setCopiedIntf(null), 2000); // Reset สถานะการ copy กลับหลัง 2 วินาที
+    } catch (err) {
+      console.error('Failed to copy', err);
+    }
+    document.body.removeChild(textArea);
+  };
+
+  const copyCids = (intfName, cids) => {
+    // จัด format เป็น 1 CID ต่อ 1 บรรทัด
+    const textToCopy = cids.join('\n');
+    
+    const textArea = document.createElement("textarea");
+    textArea.value = textToCopy;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      setCopiedCidIntf(intfName);
+      setTimeout(() => setCopiedCidIntf(null), 2000);
+    } catch (err) {
+      console.error('Failed to copy', err);
+    }
+    document.body.removeChild(textArea);
+  };
+
+  const exportToExcel = () => {
+    const BOM = "\uFEFF";
+    const headers = ['ลำดับ', 'Interface', 'VLAN', 'ข้อมูลต้นฉบับ (Raw Data)', 'CID', 'ชื่อลูกค้า (Customer)', 'Bandwidth (Mbps)', 'Bandwidth (Gbps)', 'สถานะข้อมูล'];
+    const csvRows = [headers.join(',')];
+
+    let totalM = 0;
+    let totalG = 0;
+
+    sortedData.forEach((row, index) => {
+      if (row.hasBw) {
+        totalM += row.bwM;
+        totalG += row.bwG;
+      }
+      const values = [
+        index + 1,
+        `"${row.interfaceName}"`,
+        `"${row.vlan}"`,
+        `"${row.raw}"`,
+        `"${row.cid}"`,
+        `"${row.customerName}"`,
+        row.hasBw ? row.bwM : 'ไม่มีข้อมูล',
+        row.hasBw ? row.bwG : 'ไม่มีข้อมูล',
+        row.hasBw ? 'ปกติ' : 'ไม่พบค่า BW'
+      ];
+      csvRows.push(values.join(','));
+    });
+
+    csvRows.push('');
+    csvRows.push(',"--- SUMMARY ---",,,,,,,,');
+    csvRows.push(',"รายละเอียด","","","","","รวม Bandwidth (Mbps)","รวม Bandwidth (Gbps)",');
+    csvRows.push(`,"รวม Bandwidth ทั้งหมด (ที่มีข้อมูล)",,,,,"${totalM}","${totalG.toFixed(2)}",`);
+
+    csvRows.push('');
+    csvRows.push(',"--- INTERFACE SUMMARY ---",,,,,,,,');
+    csvRows.push(',"Interface","จำนวน VLAN","รวม Bandwidth (Gbps)","Member VLANs",,,,,,');
+    interfaceSummary.forEach(intf => {
+      csvRows.push(`,"${intf.name}","${intf.vlanCount}","${intf.totalBwG.toFixed(2)}","${intf.vlans.join(', ')}",,,,,,`);
+    });
+
+    const blob = new Blob([BOM + csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', 'NPD_Bandwidth_Analyzer.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const CustomTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      const data = payload[0].payload;
+      return (
+        <div className="bg-white p-5 border border-slate-100 rounded-xl shadow-xl shadow-slate-200/50 text-slate-700 font-sans text-sm min-w-[200px]">
+          <p className="font-bold text-blue-700 mb-1 text-base">{data.customerName}</p>
+          <p className="mb-1"><span className="text-slate-400 text-xs uppercase tracking-wider">CID:</span> <span className="font-mono font-medium">{data.cid}</span></p>
+          <p className="mb-4"><span className="text-slate-400 text-xs uppercase tracking-wider">PORT:</span> <span className="font-mono font-medium">{data.interfaceName} {data.vlan !== '-' ? `(VLAN: ${data.vlan})` : ''}</span></p>
+          <div className="border-t border-slate-100 pt-3 font-mono">
+            <p className="text-emerald-600 font-bold text-xl leading-none">{data.bwM} <span className="text-sm font-semibold text-emerald-500">Mbps</span></p>
+            <p className="text-slate-400 text-xs mt-1">({data.bwG} Gbps)</p>
+          </div>
+        </div>
+      );
+    }
+    return null;
+  };
+
+  return (
+    <div className="min-h-screen bg-[#F8FAFC] text-slate-800 font-sans p-4 md:p-6 selection:bg-blue-100">
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+      `}</style>
+      
+      <div className="max-w-[1400px] mx-auto space-y-6">
+        
+        {/* Header - Modern Enterprise Style */}
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center bg-white p-5 md:p-6 rounded-2xl border border-slate-200 shadow-sm relative overflow-hidden">
+          <div className="absolute top-0 left-0 w-1.5 h-full bg-blue-600"></div>
+          <div className="flex items-center space-x-4 pl-2">
+            <div className="bg-blue-50 p-3 rounded-xl text-blue-600">
+              <Network size={28} strokeWidth={2} />
             </div>
+            <div>
+              <h1 className="text-2xl md:text-3xl font-bold text-slate-900 tracking-tight">NPD BANDWIDTH ANALYZER</h1>
+              <p className="text-slate-500 text-sm mt-1 font-medium">Interface • VLAN • CID Extraction & Analytics Tool</p>
+            </div>
+          </div>
+          <button 
+            onClick={exportToExcel}
+            className="mt-4 md:mt-0 flex items-center space-x-2 bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 px-5 py-2.5 rounded-xl text-sm font-bold transition-all hover:border-slate-400 hover:shadow-sm focus:ring-4 focus:ring-slate-100 outline-none"
+          >
+            <Download size={18} className="text-slate-500" />
+            <span>Export CSV</span>
+          </button>
         </div>
 
-        <!-- Dashboard -->
-        <div id="dashboard" class="hidden space-y-8 animate-fade-in-up pb-24">
-            
-            <!-- Global Search Bar -->
-            <div class="sticky top-20 z-40 mx-auto max-w-4xl -mt-4 mb-8">
-                <div class="relative group">
-                    <div class="absolute -inset-0.5 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-2xl blur opacity-25 group-hover:opacity-50 transition duration-1000 group-hover:duration-200"></div>
-                    <div class="relative bg-white rounded-xl shadow-lg flex items-center">
-                        <div class="pl-6 text-slate-400">
-                            <i class="fa-solid fa-search text-xl"></i>
-                        </div>
-                        <input type="text" id="globalSearch" onkeyup="handleGlobalSearch()" 
-                            class="block w-full px-4 py-4 bg-transparent border-none rounded-xl text-slate-700 placeholder-slate-400 focus:ring-0 text-lg" 
-                            placeholder="ค้นหาทุกอย่าง... (Item No, Description, Location, Date)">
-                        <div class="pr-6 text-xs font-semibold text-indigo-600" id="searchStatus">
-                            ALL DATA
-                        </div>
-                    </div>
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+          {/* Input Section */}
+          <div className="xl:col-span-1 bg-white rounded-2xl border border-slate-200 p-5 shadow-sm flex flex-col">
+            <div className="flex items-center justify-between mb-4">
+              <label className="text-sm font-bold text-slate-700 flex items-center">
+                Raw Router Configuration
+              </label>
+              <div className="flex items-center space-x-3">
+                {inputText && (
+                  <button 
+                    onClick={handleClear}
+                    className="text-slate-400 hover:text-rose-500 transition-colors flex items-center text-[11px] font-bold uppercase tracking-wider outline-none"
+                    title="Clear all data"
+                  >
+                    <Trash2 size={14} className="mr-1" /> Clear
+                  </button>
+                )}
+                <div className="bg-slate-100 text-slate-500 text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wider">
+                  Input
                 </div>
+              </div>
+            </div>
+            <textarea
+              className="w-full flex-1 min-h-[200px] xl:min-h-[280px] p-4 bg-slate-50 border border-slate-200 rounded-xl text-[13px] text-slate-600 font-mono focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none custom-scrollbar leading-relaxed resize-y"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              spellCheck="false"
+              placeholder="# Paste raw interface descriptions here...&#10;> Eth-Trunk4.1178 up up @@_BI48600_..._@@&#10;> GE0/6/8.446(10G) up up @@_ME08493..._@@"
+            />
+            <button
+              onClick={handleAnalyze}
+              className="w-full mt-4 bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-xl text-sm font-bold transition-all shadow-sm shadow-blue-600/20 hover:shadow-md hover:shadow-blue-600/30 flex justify-center items-center space-x-2 outline-none"
+            >
+              <Activity size={18} />
+              <span>Analyze Data</span>
+            </button>
+          </div>
+
+          {/* Stats & Chart Section */}
+          <div className="xl:col-span-2 space-y-6 flex flex-col">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-center">
+                <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Total Nodes</p>
+                <p className="text-3xl font-bold text-slate-800">{stats.total}</p>
+              </div>
+              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-center">
+                <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Valid BW Data</p>
+                <p className="text-3xl font-bold text-emerald-600">{stats.withBw}</p>
+              </div>
+              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-center">
+                <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Missing / MGM</p>
+                <p className="text-3xl font-bold text-rose-500">{stats.missingBw}</p>
+              </div>
+              <div className="bg-blue-600 p-5 rounded-2xl shadow-sm shadow-blue-600/20 flex flex-col justify-center relative overflow-hidden">
+                <div className="absolute -right-4 -bottom-4 opacity-10">
+                  <Activity size={100} />
+                </div>
+                <p className="text-blue-100 text-xs font-bold uppercase tracking-wider mb-1">Total Traffic</p>
+                <p className="text-3xl font-bold text-white relative z-10">{stats.totalGbps} <span className="text-base font-semibold text-blue-200">Gbps</span></p>
+              </div>
             </div>
 
-            <!-- Stats Overview -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <!-- Card 1 -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex items-center justify-between hover:shadow-md transition-shadow relative overflow-hidden group">
-                    <div class="absolute right-0 top-0 h-full w-1 bg-indigo-500"></div>
-                    <div>
-                        <p class="text-sm font-semibold text-slate-500 mb-1">Total Records</p>
-                        <h3 class="text-4xl font-bold text-slate-800" id="totalRows">0</h3>
-                        <p class="text-xs text-indigo-500 font-medium mt-1">Filtered Data</p>
-                    </div>
-                    <div class="w-14 h-14 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-600 group-hover:scale-110 transition-transform">
-                        <i class="fa-solid fa-layer-group text-2xl"></i>
-                    </div>
+            <div className="bg-white p-5 md:p-6 rounded-2xl border border-slate-200 flex-1 flex flex-col shadow-sm">
+              <h2 className="text-sm font-bold text-slate-800 mb-6 flex items-center">
+                <div className="w-2 h-2 rounded-full bg-blue-600 mr-2"></div>
+                Top 30 Utilization (Mbps)
+              </h2>
+              {chartData.length > 0 ? (
+                <div className="flex-1 w-full min-h-[220px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 40 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                      <XAxis 
+                        dataKey="shortName" 
+                        angle={-45} 
+                        textAnchor="end" 
+                        tick={{fontSize: 11, fill: '#64748b'}}
+                        interval={0} 
+                        height={50} 
+                        stroke="#cbd5e1"
+                      />
+                      <YAxis 
+                        tickFormatter={(value) => `${value}M`} 
+                        tick={{fontSize: 11, fill: '#64748b', fontFamily: 'monospace'}}
+                        width={80}
+                        stroke="#cbd5e1"
+                      />
+                      <RechartsTooltip content={<CustomTooltip />} cursor={{fill: '#f8fafc'}} />
+                      <Bar 
+                        dataKey="bwM" 
+                        fill="#3b82f6" 
+                        radius={[4, 4, 0, 0]} 
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
                 </div>
-                
-                <!-- Card 2 -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex items-center justify-between hover:shadow-md transition-shadow relative overflow-hidden group">
-                    <div class="absolute right-0 top-0 h-full w-1 bg-blue-500"></div>
-                    <div>
-                        <p class="text-sm font-semibold text-slate-500 mb-1">Customer (C)</p>
-                        <h3 class="text-4xl font-bold text-blue-600" id="countC">0</h3>
-                        <p class="text-xs text-blue-400 font-medium mt-1">External</p>
-                    </div>
-                    <div class="w-14 h-14 bg-blue-50 rounded-2xl flex items-center justify-center text-blue-600 group-hover:scale-110 transition-transform">
-                        <i class="fa-solid fa-users text-2xl"></i>
-                    </div>
+              ) : (
+                <div className="flex-1 flex items-center justify-center text-slate-400 text-sm border-2 border-dashed border-slate-100 rounded-xl bg-slate-50/50 font-medium">
+                  Waiting for data to generate chart...
                 </div>
-
-                <!-- Card 3 -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex items-center justify-between hover:shadow-md transition-shadow relative overflow-hidden group">
-                    <div class="absolute right-0 top-0 h-full w-1 bg-emerald-500"></div>
-                    <div>
-                        <p class="text-sm font-semibold text-slate-500 mb-1">General (N)</p>
-                        <h3 class="text-4xl font-bold text-emerald-600" id="countN">0</h3>
-                        <p class="text-xs text-emerald-400 font-medium mt-1">Normal</p>
-                    </div>
-                    <div class="w-14 h-14 bg-emerald-50 rounded-2xl flex items-center justify-center text-emerald-600 group-hover:scale-110 transition-transform">
-                        <i class="fa-solid fa-box-open text-2xl"></i>
-                    </div>
-                </div>
+              )}
             </div>
+          </div>
+        </div>
 
-            <!-- Data Quality Alert -->
-            <div id="dataQualityAlert" class="hidden bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col sm:flex-row justify-between items-center gap-4">
-                <div class="flex items-center gap-3 text-amber-800">
-                    <i class="fa-solid fa-triangle-exclamation text-2xl text-amber-500"></i>
-                    <div>
-                        <h4 class="font-bold text-sm">พบข้อมูลที่ไม่เข้าเงื่อนไข (Ignored Data)</h4>
-                        <p class="text-xs text-amber-700">มี <span id="ignoredCount" class="font-bold text-amber-900">0</span> รายการที่ถูกตัดออกเนื่องจาก To Sub ไม่ใช่ C/N หรือ From Sub ไม่อยู่ในระบบ</p>
-                    </div>
-                </div>
-                <button onclick="exportIgnoredData()" class="text-xs font-bold bg-white text-amber-700 border border-amber-300 px-4 py-2 rounded-lg hover:bg-amber-100 transition shadow-sm whitespace-nowrap">
-                    <i class="fa-solid fa-download mr-1"></i> โหลดข้อมูลที่ตกหล่น
-                </button>
-            </div>
+        {/* Interface Summary Section */}
+        {interfaceSummary.length > 0 && (
+          <div className="bg-white rounded-2xl border border-slate-200 p-5 md:p-6 shadow-sm">
+            <h2 className="text-sm font-bold text-slate-800 mb-6 flex items-center">
+              <Server size={18} className="mr-2 text-indigo-500" />
+              Aggregated Port Summary (Trunk & Physical)
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {interfaceSummary.map((intf, idx) => (
+                <div key={idx} className="bg-white border border-slate-200 hover:border-indigo-300 transition-colors rounded-xl p-5 flex flex-col shadow-sm hover:shadow-md">
+                  <div className="flex justify-between items-start mb-4">
+                    <span className="font-bold text-slate-800 text-base">{intf.name}</span>
+                    <span className="bg-indigo-50 text-indigo-700 text-[11px] font-bold px-2.5 py-1 rounded-full uppercase tracking-wide">
+                      {intf.vlanCount} VLANs
+                    </span>
+                  </div>
+                  
+                  <div className="flex items-baseline justify-between border-b border-slate-100 pb-4 mb-4">
+                    <span className="text-xs text-slate-500 font-bold uppercase tracking-wider">Aggregated BW</span>
+                    <span className="font-bold text-indigo-600 text-2xl leading-none font-mono">{intf.totalBwG.toFixed(2)} <span className="text-sm text-indigo-400 font-sans">Gbps</span></span>
+                  </div>
 
-            <!-- Charts Section (Row 1: Trend & Top Items) -->
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <!-- Trend Line Chart -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col">
-                    <div class="flex items-center justify-between mb-6">
-                        <h3 class="font-bold text-slate-700 flex items-center gap-2">
-                            <span class="w-2 h-6 bg-indigo-500 rounded-full"></span>
-                            แนวโน้มการเบิกจ่าย (Trend)
-                        </h3>
-                    </div>
-                    <div class="chart-container flex-grow">
-                        <canvas id="chartTrend"></canvas>
-                    </div>
-                </div>
-
-                <!-- Top Items Bar Chart -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col">
-                    <div class="flex items-center justify-between mb-6">
-                        <h3 class="font-bold text-slate-700 flex items-center gap-2">
-                            <span class="w-2 h-6 bg-indigo-500 rounded-full"></span>
-                            10 อันดับสินค้าที่มีการเคลื่อนไหวสูงสุด
-                        </h3>
-                    </div>
-                    <div class="chart-container flex-grow">
-                        <canvas id="chartTopItems"></canvas>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Charts Section (Row 2: Original Charts) -->
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <!-- Pie Chart -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 lg:col-span-1 flex flex-col">
-                    <div class="flex items-center justify-between mb-6">
-                        <h3 class="font-bold text-slate-700 flex items-center gap-2">
-                            <span class="w-2 h-6 bg-indigo-500 rounded-full"></span>
-                            สัดส่วนปลายทาง
-                        </h3>
-                    </div>
-                    <div class="chart-container flex-grow">
-                        <canvas id="chartPrefix"></canvas>
-                    </div>
-                </div>
-
-                <!-- Top Destinations -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 lg:col-span-2 flex flex-col">
-                    <div class="flex items-center justify-between mb-6">
-                        <h3 class="font-bold text-slate-700 flex items-center gap-2">
-                            <span class="w-2 h-6 bg-indigo-500 rounded-full"></span>
-                            10 อันดับปลายทางสูงสุด
-                        </h3>
-                    </div>
-                    <div class="chart-container flex-grow">
-                        <canvas id="chartTopTo"></canvas>
-                    </div>
-                </div>
-
-                <!-- From Sub Overview -->
-                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 lg:col-span-3">
-                    <div class="flex items-center justify-between mb-6">
-                        <h3 class="font-bold text-slate-700 flex items-center gap-2">
-                            <span class="w-2 h-6 bg-indigo-500 rounded-full"></span>
-                            ปริมาณงานแยกตามต้นทาง (From Sub)
-                        </h3>
-                    </div>
-                    <div class="chart-container">
-                        <canvas id="chartFrom"></canvas>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Summary Table 1 -->
-            <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-                <div class="px-6 py-5 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-center gap-4 bg-gradient-to-r from-white to-slate-50">
-                    <h3 class="font-bold text-slate-700 flex items-center gap-3">
-                        <div class="p-2 bg-indigo-100 text-indigo-600 rounded-lg"><i class="fa-solid fa-warehouse"></i></div>
-                        สรุป Main Stock
-                        <span class="text-xs font-normal bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full ml-2" id="summaryMainCountBadge">0</span>
-                    </h3>
-                    <button onclick="exportSingleSheet('main')" class="text-xs font-bold bg-white border border-slate-200 text-slate-600 px-4 py-2 rounded-lg hover:bg-indigo-50 hover:text-indigo-600 hover:border-indigo-200 transition flex items-center gap-2 shadow-sm">
-                        <i class="fa-solid fa-file-arrow-down"></i> Export
-                    </button>
-                </div>
-                <div class="overflow-x-auto max-h-[450px]">
-                    <table class="min-w-full text-sm text-left">
-                        <thead class="text-xs text-slate-500 uppercase bg-slate-50/80 sticky top-0 z-10 backdrop-blur-sm">
-                            <tr>
-                                <th class="px-6 py-4 font-semibold tracking-wider">Item No.</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider">Description</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider">From Sub</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider">From Name</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider text-right text-blue-600">Customer</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider text-right text-emerald-600">Node</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider text-right">Total</th>
-                            </tr>
-                        </thead>
-                        <tbody id="summaryTableMain" class="divide-y divide-slate-100 text-slate-600"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Summary Table 2 -->
-            <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-                <div class="px-6 py-5 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-center gap-4 bg-gradient-to-r from-white to-rose-50/30">
-                    <h3 class="font-bold text-slate-700 flex items-center gap-3">
-                        <div class="p-2 bg-rose-100 text-rose-600 rounded-lg"><i class="fa-solid fa-triangle-exclamation"></i></div>
-                        สรุป Service / Defect Stock
-                        <span class="text-xs font-normal bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full ml-2" id="summaryServiceCountBadge">0</span>
-                    </h3>
-                    <button onclick="exportSingleSheet('service')" class="text-xs font-bold bg-white border border-slate-200 text-slate-600 px-4 py-2 rounded-lg hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition flex items-center gap-2 shadow-sm">
-                        <i class="fa-solid fa-file-arrow-down"></i> Export
-                    </button>
-                </div>
-                <div class="overflow-x-auto max-h-[450px]">
-                    <table class="min-w-full text-sm text-left">
-                        <thead class="text-xs text-slate-500 uppercase bg-slate-50/80 sticky top-0 z-10 backdrop-blur-sm">
-                            <tr>
-                                <th class="px-6 py-4 font-semibold tracking-wider">Item No.</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider">Description</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider">From Sub</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider">From Name</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider text-right text-blue-600">Customer</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider text-right text-emerald-600">Node</th>
-                                <th class="px-6 py-4 font-semibold tracking-wider text-right">Total</th>
-                            </tr>
-                        </thead>
-                        <tbody id="summaryTableService" class="divide-y divide-slate-100 text-slate-600"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Detail Table (Main Data) -->
-            <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-                <div class="px-6 py-5 border-b border-slate-100 flex flex-col md:flex-row justify-between items-center gap-4">
-                    <h3 class="font-bold text-slate-700 flex items-center gap-3">
-                        <div class="p-2 bg-slate-100 text-slate-600 rounded-lg"><i class="fa-solid fa-table-list"></i></div>
-                        ข้อมูลรายละเอียดทั้งหมด
-                    </h3>
-                    <div class="flex items-center gap-3">
-                        <span class="hidden md:inline-flex items-center gap-2 px-3 py-1 bg-slate-50 text-slate-400 text-xs rounded-full border border-slate-100">
-                            <i class="fa-solid fa-filter"></i> Filter Active
-                        </span>
-                        <button onclick="exportSingleSheet('detail')" class="text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 px-4 py-2 rounded-lg hover:bg-emerald-100 transition flex items-center gap-2 shadow-sm">
-                            <i class="fa-solid fa-file-excel"></i> Export Details
+                  {/* แสดงรายการ VLAN ย่อยทั้งหมด */}
+                  <div className="flex-1 relative">
+                    <div className="flex justify-between items-center mb-2">
+                      <p className="text-xs text-slate-500 font-bold">Member VLANs</p>
+                      {intf.vlans.length > 0 && (
+                        <button
+                          onClick={() => copyVlans(intf.name, intf.vlans)}
+                          className="text-slate-400 hover:text-indigo-600 transition-colors flex items-center space-x-1"
+                          title="Copy VLANs (1 per line)"
+                        >
+                          {copiedIntf === intf.name ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
+                          <span className={`text-[10px] uppercase font-bold ${copiedIntf === intf.name ? 'text-emerald-500' : ''}`}>
+                            {copiedIntf === intf.name ? 'Copied!' : 'Copy'}
+                          </span>
                         </button>
+                      )}
                     </div>
-                </div>
-                
-                <div class="overflow-x-auto">
-                    <table class="min-w-full text-sm text-left text-slate-500" id="dataTable">
-                        <thead class="text-xs text-slate-500 uppercase bg-slate-50 sticky top-0 z-20">
-                            <tr>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap group cursor-pointer hover:bg-slate-100 transition relative bg-slate-100/50" onclick="toggleFilter('filter-date')">
-                                    <div class="flex items-center justify-between gap-2">Date (Col K)<i class="fa-solid fa-calendar-days text-slate-300 group-hover:text-indigo-500 transition"></i></div>
-                                    <div id="filter-date" class="filter-dropdown font-normal normal-case text-slate-600" onclick="event.stopPropagation()"></div>
-                                </th>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap group cursor-pointer hover:bg-slate-100 transition relative" onclick="toggleFilter('filter-itemno')">
-                                    <div class="flex items-center justify-between gap-2">Item No.<i class="fa-solid fa-filter text-slate-300 group-hover:text-indigo-500 transition"></i></div>
-                                    <div id="filter-itemno" class="filter-dropdown font-normal normal-case text-slate-600" onclick="event.stopPropagation()"></div>
-                                </th>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap group cursor-pointer hover:bg-slate-100 transition relative" onclick="toggleFilter('filter-desc')">
-                                    <div class="flex items-center justify-between gap-2">Description<i class="fa-solid fa-filter text-slate-300 group-hover:text-indigo-500 transition"></i></div>
-                                    <div id="filter-desc" class="filter-dropdown font-normal normal-case text-slate-600" onclick="event.stopPropagation()"></div>
-                                </th>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap group cursor-pointer hover:bg-indigo-50 transition relative bg-indigo-50/30" onclick="toggleFilter('filter-from-orig')">
-                                    <div class="flex items-center justify-between gap-2 text-indigo-900">From Sub<i class="fa-solid fa-filter text-indigo-300 group-hover:text-indigo-600 transition"></i></div>
-                                    <div id="filter-from-orig" class="filter-dropdown font-normal normal-case text-slate-600" onclick="event.stopPropagation()"></div>
-                                </th>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap text-indigo-900 bg-indigo-50/30">From Name</th>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap group cursor-pointer hover:bg-emerald-50 transition relative bg-emerald-50/30" onclick="toggleFilter('filter-to-orig')">
-                                    <div class="flex items-center justify-between gap-2 text-emerald-900">To Sub<i class="fa-solid fa-filter text-emerald-300 group-hover:text-emerald-600 transition"></i></div>
-                                    <div id="filter-to-orig" class="filter-dropdown font-normal normal-case text-slate-600" onclick="event.stopPropagation()"></div>
-                                </th>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap text-emerald-900 bg-emerald-50/30">To Name</th>
-                                <th class="px-6 py-4 font-semibold whitespace-nowrap group cursor-pointer hover:bg-slate-100 transition relative" onclick="toggleFilter('filter-type')">
-                                    <div class="flex items-center justify-between gap-2">Type<i class="fa-solid fa-filter text-slate-300 group-hover:text-indigo-500 transition"></i></div>
-                                    <div id="filter-type" class="filter-dropdown font-normal normal-case text-slate-600" onclick="event.stopPropagation()"></div>
-                                </th>
-                            </tr>
-                        </thead>
-                        <tbody id="tableBody" class="divide-y divide-slate-100 bg-white"></tbody>
-                    </table>
-                </div>
-                <div class="p-12 text-center text-slate-400 text-sm hidden" id="emptyTableMsg">
-                    <div class="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-4">
-                        <i class="fa-solid fa-filter-circle-xmark text-2xl text-slate-300"></i>
+                    {intf.vlans.length > 0 ? (
+                      <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto custom-scrollbar pr-1 font-mono">
+                        {intf.vlans.map(v => (
+                          <span key={v} className="bg-slate-50 border border-slate-200 text-slate-600 text-[11px] font-medium px-2 py-0.5 rounded-md">
+                            {v}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-slate-400 italic bg-slate-50 px-2 py-1 rounded-md">Native / Untagged</span>
+                    )}
+                  </div>
+
+                  {/* แสดงรายการ CID ย่อยทั้งหมด */}
+                  <div className="mt-4 flex-1 relative border-t border-slate-100 pt-4">
+                    <div className="flex justify-between items-center mb-2">
+                      <p className="text-xs text-slate-500 font-bold">CIDs</p>
+                      {intf.cids.length > 0 && (
+                        <button
+                          onClick={() => copyCids(intf.name, intf.cids)}
+                          className="text-slate-400 hover:text-blue-600 transition-colors flex items-center space-x-1"
+                          title="Copy CIDs (1 per line)"
+                        >
+                          {copiedCidIntf === intf.name ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
+                          <span className={`text-[10px] uppercase font-bold ${copiedCidIntf === intf.name ? 'text-emerald-500' : ''}`}>
+                            {copiedCidIntf === intf.name ? 'Copied!' : 'Copy'}
+                          </span>
+                        </button>
+                      )}
                     </div>
-                    <p class="font-medium">ไม่พบข้อมูลที่ตรงกับเงื่อนไข</p>
-                    <p class="text-xs mt-1">ลองเปลี่ยนคำค้นหาหรือตัวกรองใหม่</p>
+                    {intf.cids.length > 0 ? (
+                      <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto custom-scrollbar pr-1 font-mono">
+                        {intf.cids.map(c => (
+                          <span key={c} className="bg-slate-50 border border-slate-200 text-slate-600 text-[11px] font-medium px-2 py-0.5 rounded-md">
+                            {c}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-slate-400 italic bg-slate-50 px-2 py-1 rounded-md">No CIDs</span>
+                    )}
+                  </div>
+
                 </div>
+              ))}
             </div>
+          </div>
+        )}
+
+        {/* Data Table Section */}
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
+          <div className="border-b border-slate-200 bg-slate-50 flex flex-col md:flex-row justify-between items-center pr-0 md:pr-4">
+            <div className="flex space-x-0 w-full md:w-auto">
+              <button
+                className={`flex-1 md:flex-none py-3.5 px-6 text-xs uppercase font-bold tracking-wider focus:outline-none flex items-center justify-center space-x-2 transition-all ${
+                  activeTab === 'all' 
+                    ? 'border-b-2 border-blue-600 text-blue-700 bg-white' 
+                    : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'
+                }`}
+                onClick={() => setActiveTab('all')}
+              >
+                <ListFilter size={16} />
+                <span>All Records ({stats.total})</span>
+              </button>
+              <button
+                className={`flex-1 md:flex-none py-3.5 px-6 text-xs uppercase font-bold tracking-wider focus:outline-none flex items-center justify-center space-x-2 transition-all ${
+                  activeTab === 'missing' 
+                    ? 'border-b-2 border-rose-500 text-rose-600 bg-white' 
+                    : 'text-slate-500 hover:text-slate-700 hover:bg-slate-100'
+                }`}
+                onClick={() => setActiveTab('missing')}
+              >
+                <AlertCircle size={16} />
+                <span>No BW Data ({stats.missingBw})</span>
+              </button>
+            </div>
+            
+            <div className="p-3 w-full md:w-auto md:p-0">
+              <div className="relative">
+                <Search size={16} className="absolute left-3 top-1/2 transform -translate-y-1/2 text-slate-400" />
+                <input 
+                  type="text" 
+                  placeholder="ค้นหา (Port, VLAN, CID, ชื่อ)..." 
+                  className="w-full md:w-72 pl-9 pr-4 py-2 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-slate-400"
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto custom-scrollbar">
+            <table className="w-full text-left border-collapse whitespace-nowrap">
+              <thead>
+                <tr className="bg-white text-slate-500 text-[11px] uppercase tracking-wider border-b border-slate-200">
+                  <th className="p-4 font-bold w-12 text-center">#</th>
+                  <th className="p-4 font-bold w-32 hidden lg:table-cell">Port</th>
+                  <th className="p-4 font-bold w-20 hidden lg:table-cell text-center">VLAN</th>
+                  <th className="p-4 font-bold w-32"><div className="flex items-center"><Hash size={14} className="mr-1"/> CID</div></th>
+                  <th className="p-4 font-bold min-w-[200px]"><div className="flex items-center"><Users size={14} className="mr-1"/> Customer</div></th>
+                  <th className="p-4 font-bold text-right w-28">BW (Mbps)</th>
+                  <th className="p-4 font-bold text-right w-24">BW (Gbps)</th>
+                  <th className="p-4 font-bold text-center w-24">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 text-sm">
+                {displayData.map((row, idx) => (
+                  <tr key={row.id} className="hover:bg-slate-50 transition-colors">
+                    <td className="p-4 text-slate-400 text-center text-xs font-mono">{idx + 1}</td>
+                    <td className="p-4 font-semibold text-slate-700 hidden lg:table-cell">{row.interfaceName}</td>
+                    <td className="p-4 text-indigo-600 font-mono hidden lg:table-cell text-center font-medium">{row.vlan !== '-' ? row.vlan : '-'}</td>
+                    <td className="p-4 font-bold text-blue-600 font-mono">{row.cid}</td>
+                    <td className="p-4 font-medium text-slate-800 truncate max-w-[300px]" title={row.customerName}>{row.customerName}</td>
+                    <td className="p-4 text-right">
+                      {row.hasBw ? (
+                        <span className="text-slate-700 font-mono font-medium bg-slate-100 px-2 py-1 rounded-md">{row.bwM.toLocaleString()}</span>
+                      ) : <span className="text-slate-300">-</span>}
+                    </td>
+                    <td className="p-4 text-right">
+                      {row.hasBw ? (
+                        <span className="text-emerald-700 font-mono font-medium bg-emerald-50 border border-emerald-100 px-2 py-1 rounded-md">{row.bwG}</span>
+                      ) : <span className="text-slate-300">-</span>}
+                    </td>
+                    <td className="p-4 text-center">
+                      {row.hasBw ? (
+                        <span className="inline-flex items-center text-emerald-500">
+                          <CheckCircle size={18} />
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center text-rose-400" title="Missing M/G identifier">
+                          <AlertCircle size={18} />
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                
+                {displayData.length === 0 ? (
+                  <tr>
+                    <td colSpan="8" className="p-12 text-center text-slate-400 text-sm font-medium">
+                      {data.length === 0 ? "No data to display. Please paste router configuration and click analyze." : "ไม่พบข้อมูลที่ตรงกับการค้นหา"}
+                    </td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
         </div>
+        
+      </div>
     </div>
-
-    <!-- Scripts -->
-    <script>
-        // Keep Chart colors mostly similar but refreshed
-        const CHART_COLORS = { 
-            C: { bg: 'rgba(59, 130, 246, 0.85)', border: '#ffffff' }, 
-            N: { bg: 'rgba(16, 185, 129, 0.85)', border: '#ffffff' } 
-        };
-
-        Chart.defaults.font.family = "'Sarabun', sans-serif";
-        Chart.defaults.color = '#64748b';
-        Chart.register(ChartDataLabels);
-
-        // Function to generate distinct colors
-        function generateColors(count) {
-            const colors = [];
-            for (let i = 0; i < count; i++) {
-                const hue = Math.floor((i * 137.5) % 360); 
-                colors.push(`hsla(${hue}, 70%, 60%, 0.8)`);
-            }
-            return colors;
-        }
-
-        // --- Configuration (SAME LOGIC) ---
-        const mainFromCodes = [
-            "AAYA01", "ABKK11", "ACBI01", "ACBI02", "ACMI01", "ACRI01", 
-            "AKKN01", "ANKI01", "ANMA01", "APKN01", "APKT01", "APLK01", 
-            "APRI01", "ASKA01", "ASKN01", "ASNI01", "ATAK01", "ATAK02", 
-            "AUBN01", "AMDH01"
-        ];
-        const defectFromCodes = [
-            "AAYA18", "ABKK18", "ACBI19", "ACBI20", "ACMI18", "ACRI18", 
-            "AKKN18", "ANKI18", "ANMA18", "APKN18", "APKT18", "APLK18", 
-            "APRI18", "ASKA18", "ASKN18", "ASNI18", "ATAK18", "ATAK19", 
-            "AUBN18"
-        ];
-        const locationMapping = {
-            "AAYA01": "Stock Service Center Ayutthaya",
-            "ABKK11": "Stock SUN TOWER 9FL.",
-            "ACBI01": "Stock Service Center Laem Chabang",
-            "ACBI02": "Stock Service Center Amata Nakorn 2nd Floor",
-            "ACMI01": "Stock Service Center Chiang Mai",
-            "ACRI01": "Stock Service Center Chiang Rai",
-            "AKKN01": "Stock Service Center Khonkaen",
-            "ANKI01": "Stock Service Center Nongkhai",
-            "ANMA01": "Stock Service Center Nakhon Ratchasima",
-            "APKN01": "Stock Service Center Prachuap Khiri Khan",
-            "APKT01": "Stock Service Center Phuket",
-            "APLK01": "Stock Service Center Phitsanulok",
-            "APRI01": "Stock Service Center Kabin Buri",
-            "ASKA01": "Stock Service Center Hat Yai",
-            "ASKN01": "Stock Service Center Samut Sakhon",
-            "ASNI01": "Stock Service Center Surat Thani",
-            "ATAK01": "Stock Service Center Mae Sot",
-            "ATAK02": "Stock Service Center Tak",
-            "AUBN01": "Stock Service Center Ubon Ratchathani",
-            "AMDH01": "Stock Service Center Mukdahan",
-            "ASNI18": "STOCK อุปกรณ์เสีย_Service Center Surat Thani",
-            "ATAK18": "STOCK อุปกรณ์เสีย_Service Center Mae Sot",
-            "ATAK19": "STOCK อุปกรณ์เสีย_Service Center Tak",
-            "AUBN18": "STOCK อุปกรณ์เสีย_Service Center Ubon Ratchathani"
-        };
-
-        let allValidData = [];
-        let filteredData = [];
-        let ignoredData = [];
-        let summaryMain = [];
-        let summaryService = [];
-        let charts = {};
-
-        // --- Logic Functions (UNCHANGED) ---
-        function resolveLocationName(code) {
-            if (!code) return "-";
-            const cleanCode = String(code).trim();
-            if (locationMapping[cleanCode]) return locationMapping[cleanCode];
-            return cleanCode;
-        }
-        function getToGroupType(code) {
-            if (!code) return "Other";
-            const cleanCode = String(code).trim().toUpperCase();
-            if (cleanCode.startsWith('C')) return "Cxxxx";
-            if (cleanCode.startsWith('N')) return "Nxxxxx";
-            return "Other";
-        }
-        function getFromGroupType(code) {
-            if (!code) return "Unknown";
-            const cleanCode = String(code).trim();
-            if (mainFromCodes.includes(cleanCode)) return "Main";
-            if (defectFromCodes.includes(cleanCode)) return "Defect";
-            return "Other";
-        }
-
-        function handleFileUpload(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                const data = new Uint8Array(e.target.result);
-                const workbook = XLSX.read(data, {type: 'array'});
-                const worksheet = workbook.Sheets[workbook.SheetNames[0]];
-                
-                // 1. Scan for the real header row (within first 20 rows)
-                const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: "" });
-                let headerRowIndex = -1;
-                let foundHeaders = [];
-
-                for(let i = 0; i < Math.min(rows.length, 20); i++) {
-                    const rowStr = rows[i].map(x => String(x).toLowerCase()).join(" ");
-                    // Flexible detection criteria
-                    if((rowStr.includes("from") && rowStr.includes("sub")) || 
-                       (rowStr.includes("item") && rowStr.includes("no")) ||
-                       rowStr.includes("รหัสสินค้า")) {
-                        headerRowIndex = i;
-                        foundHeaders = rows[i];
-                        break;
-                    }
-                }
-
-                if (headerRowIndex === -1) {
-                    alert("ไม่พบแถวหัวตาราง (Header) ที่มีคำว่า 'From Sub' หรือ 'Item No' ใน 20 บรรทัดแรก");
-                    return;
-                }
-
-                // 2. Read data starting from the found header row
-                const jsonData = XLSX.utils.sheet_to_json(worksheet, { range: headerRowIndex, defval: "" });
-                
-                if (jsonData.length === 0) { alert("ไฟล์ว่างเปล่า หรือไม่พบข้อมูลใต้หัวตาราง"); return; }
-                
-                const headers = Object.keys(jsonData[0]);
-                
-                // 3. Robust Column Mapping (UPDATED Logic to prevent grouping errors)
-                const colKHeader = (foundHeaders && foundHeaders.length > 10) ? foundHeaders[10] : null;
-
-                const keyMap = {
-                    itemNo: headers.find(h => /(item.*no|รหัส|part|mat)/i.test(h)) || headers[0],
-                    desc: headers.find(h => /(desc|name|detail|ชื่อ|รายละเอียด)/i.test(h)) || headers[1],
-                    fromSub: headers.find(h => /(from.*sub|ต้นทาง)/i.test(h)),
-                    toSub: headers.find(h => /(to.*sub|ปลายทาง)/i.test(h)),
-                    date: colKHeader ? colKHeader : headers.find(h => /(date|time|day|วัน|doc.*date|post.*date|dct|d\/m\/y|create|timestamp)/i.test(h))
-                };
-                
-                if (!keyMap.fromSub || !keyMap.toSub) { alert("ไม่พบคอลัมน์ From Sub หรือ To Sub (กรุณาตรวจสอบชื่อคอลัมน์)"); return; }
-                
-                if (!keyMap.date) {
-                    console.warn("ไม่พบคอลัมน์วันที่ (Date) - โปรแกรมจะแสดงผลโดยไม่มีวันที่");
-                }
-                
-                processInitialData(jsonData, keyMap);
-            };
-            reader.readAsArrayBuffer(file);
-        }
-
-        function parseExcelDate(val) {
-            if (val === undefined || val === null) return null;
-            
-            // 1. Handle Excel Serial Number (e.g., 45345, 45345.123)
-            if (typeof val === 'number') {
-                const d = XLSX.SSF.parse_date_code(val);
-                if (d) return new Date(d.y, d.m - 1, d.d);
-            }
-            
-            const strVal = String(val).trim();
-            if (!strVal || strVal === '-' || strVal === '0') return null;
-
-            // 2. Handle Thai/European Format DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
-            // Matches start of string: 31/01/2024 10:00:00 -> Matches 31/01/2024
-            const simpleDateMatch = strVal.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
-            if (simpleDateMatch) {
-                let day = parseInt(simpleDateMatch[1]);
-                let month = parseInt(simpleDateMatch[2]) - 1;
-                let year = parseInt(simpleDateMatch[3]);
-                
-                // Handle Buddhist Year (if > 2400) or Short Year (if < 100)
-                if (year > 2400) year -= 543;
-                else if (year < 100) year += 2000;
-
-                const d = new Date(year, month, day);
-                if (!isNaN(d.getTime())) return d;
-            }
-
-            // 3. Try standard Date parsing (ISO, US format)
-            // If string has time "2024-01-31 10:30", Date() handles it fine
-            const date = new Date(strVal);
-            if (!isNaN(date.getTime())) {
-                return date;
-            }
-            
-            return null;
-        }
-
-        function processInitialData(data, keyMap) {
-            try {
-                ignoredData = [];
-                allValidData = data.reduce((acc, row) => {
-                    const fromCode = String(row[keyMap.fromSub] || "").trim();
-                    const toCode = String(row[keyMap.toSub] || "").trim();
-                    const toType = getToGroupType(toCode);
-                    const fromType = getFromGroupType(fromCode);
-
-                    // Capture Ignored Data
-                    if (toType === "Other" || fromType === "Other") {
-                        let reason = [];
-                        if (fromType === "Other") reason.push("Invalid FromSub");
-                        if (toType === "Other") reason.push("Invalid ToSub (Not C/N)");
-                        
-                        ignoredData.push({
-                            ItemNo: String(row[keyMap.itemNo] || ""),
-                            Description: String(row[keyMap.desc] || ""),
-                            FromSub: fromCode,
-                            ToSub: toCode,
-                            RejectReason: reason.join(", ")
-                        });
-                        return acc;
-                    }
-
-                    // Date Parsing
-                    let dateObj = null;
-                    let dateStr = "-";
-                    
-                    if (keyMap.date && row[keyMap.date]) {
-                        dateObj = parseExcelDate(row[keyMap.date]);
-                        if (dateObj) {
-                            const d = dateObj.getDate().toString().padStart(2, '0');
-                            const m = (dateObj.getMonth() + 1).toString().padStart(2, '0');
-                            const y = dateObj.getFullYear();
-                            // Ensure time is stripped in display string
-                            dateStr = `${d}/${m}/${y}`;
-                        }
-                    }
-
-                    acc.push({
-                        ItemNo: String(row[keyMap.itemNo] || ""),
-                        Description: String(row[keyMap.desc] || ""),
-                        FromSub: fromCode,
-                        FromSubName: resolveLocationName(fromCode),
-                        FromGroup: fromType,
-                        ToSub: toCode,
-                        ToSubName: resolveLocationName(toCode),
-                        ToSubType: toType,
-                        DateRaw: dateObj,     
-                        DateDisplay: dateStr  
-                    });
-                    return acc;
-                }, []);
-                
-                // Sort by Date (Newest first) by default
-                allValidData.sort((a, b) => {
-                    // Safe sort for null dates
-                    const timeA = a.DateRaw ? a.DateRaw.getTime() : 0;
-                    const timeB = b.DateRaw ? b.DateRaw.getTime() : 0;
-                    return timeB - timeA;
-                });
-
-                if (allValidData.length === 0) { 
-                    alert("ไม่พบข้อมูลที่ตรงกับเงื่อนไข (Cxxxx หรือ Nxxxxx)"); 
-                    return; 
-                }
-
-                document.getElementById('welcomeScreen').classList.add('hidden');
-                document.getElementById('dashboard').classList.remove('hidden');
-                document.getElementById('navUploadBtn').classList.remove('hidden');
-                document.getElementById('exportBtn').classList.remove('hidden');
-                document.getElementById('printBtn').classList.remove('hidden');
-
-                if (ignoredData.length > 0) {
-                    document.getElementById('dataQualityAlert').classList.remove('hidden');
-                    document.getElementById('ignoredCount').innerText = ignoredData.length.toLocaleString();
-                } else {
-                    document.getElementById('dataQualityAlert').classList.add('hidden');
-                }
-
-                initFilters();
-                runPipeline();
-            } catch (err) {
-                console.error(err);
-                alert("เกิดข้อผิดพลาดในการประมวลผลข้อมูล: " + err.message);
-            }
-        }
-
-        let activeFilters = {
-            'filter-date': { field: 'DateDisplay', selected: [] },
-            'filter-itemno': { field: 'ItemNo', selected: [] },
-            'filter-desc': { field: 'Description', selected: [] },
-            'filter-from-orig': { field: 'FromSub', selected: [] },
-            'filter-to-orig': { field: 'ToSub', selected: [] },
-            'filter-type': { field: 'ToSubType', selected: [] },
-        };
-
-        function handleGlobalSearch() { runPipeline(); }
-
-        function runPipeline() {
-            const searchTerm = document.getElementById('globalSearch').value.toLowerCase();
-            filteredData = allValidData.filter(row => {
-                const passFilters = Object.keys(activeFilters).every(id => {
-                    const sel = activeFilters[id].selected;
-                    if(sel.length === 0) return true; 
-                    return sel.includes(row[activeFilters[id].field]);
-                });
-                if(!passFilters) return false;
-                if(searchTerm) {
-                    const searchStr = `${row.DateDisplay} ${row.ItemNo} ${row.Description} ${row.FromSub} ${row.FromSubName} ${row.ToSub} ${row.ToSubName}`.toLowerCase();
-                    if(!searchStr.includes(searchTerm)) return false;
-                }
-                return true;
-            });
-            const statusEl = document.getElementById('searchStatus');
-            if(allValidData.length === filteredData.length) statusEl.innerText = "ALL DATA";
-            else statusEl.innerText = `FILTERED: ${filteredData.length.toLocaleString()} / ${allValidData.length.toLocaleString()}`;
-
-            const mapMain = new Map();
-            const mapService = new Map();
-
-            filteredData.forEach(item => {
-                const key = `${item.ItemNo}|${item.FromSub}`; // Group by Item + FromSub
-                
-                const baseData = {
-                    ItemNo: item.ItemNo,
-                    Description: item.Description,
-                    FromSub: item.FromSub,
-                    FromSubName: item.FromSubName,
-                    Customer: 0,
-                    Node: 0,
-                    total: 0
-                };
-
-                let map = (item.FromGroup === 'Main') ? mapMain : mapService;
-
-                if (!map.has(key)) map.set(key, baseData);
-                const entry = map.get(key);
-
-                if (item.ToSubType === 'Cxxxx') entry.Customer++;
-                if (item.ToSubType === 'Nxxxxx') entry.Node++;
-                entry.total++;
-            });
-
-            summaryMain = Array.from(mapMain.values());
-            summaryService = Array.from(mapService.values());
-
-            updateStats();
-            renderCharts();
-            renderTables();
-        }
-
-        function updateStats() {
-            document.getElementById('totalRows').innerText = filteredData.length.toLocaleString();
-            document.getElementById('countC').innerText = filteredData.filter(d => d.ToSubType === 'Cxxxx').length.toLocaleString();
-            document.getElementById('countN').innerText = filteredData.filter(d => d.ToSubType === 'Nxxxxx').length.toLocaleString();
-            document.getElementById('summaryMainCountBadge').innerText = `${summaryMain.length}`;
-            document.getElementById('summaryServiceCountBadge').innerText = `${summaryService.length}`;
-        }
-
-        function renderCharts() {
-            if(charts.prefix) charts.prefix.destroy();
-            if(charts.topTo) charts.topTo.destroy();
-            if(charts.from) charts.from.destroy();
-            if(charts.trend) charts.trend.destroy();
-            if(charts.topItems) charts.topItems.destroy();
-
-            const prefixCounts = { "Cxxxx": 0, "Nxxxxx": 0 };
-            const toCounts = {};
-            const fromCounts = {};
-            const dateCounts = {};
-            const itemCounts = {};
-
-            filteredData.forEach(d => {
-                if(prefixCounts[d.ToSubType] !== undefined) prefixCounts[d.ToSubType]++;
-                
-                const toName = d.ToSubName || d.ToSub;
-                toCounts[toName] = (toCounts[toName] || 0) + 1;
-                
-                const fromName = d.FromSubName || d.FromSub;
-                fromCounts[fromName] = (fromCounts[fromName] || 0) + 1;
-
-                if(d.DateDisplay && d.DateDisplay !== '-') {
-                    dateCounts[d.DateDisplay] = (dateCounts[d.DateDisplay] || 0) + 1;
-                }
-
-                if(d.ItemNo) {
-                    // Combine ItemNo and Description for clearer chart labels
-                    const itemName = d.Description && d.Description !== d.ItemNo ? `${d.ItemNo} - ${d.Description}` : d.ItemNo;
-                    itemCounts[itemName] = (itemCounts[itemName] || 0) + 1;
-                }
-            });
-
-            // Trend Chart (Line)
-            const sortedDates = Object.keys(dateCounts).sort((a, b) => {
-                const [d1, m1, y1] = a.split('/');
-                const [d2, m2, y2] = b.split('/');
-                return new Date(y1, m1-1, d1) - new Date(y2, m2-1, d2);
-            });
-            const ctxTrend = document.getElementById('chartTrend').getContext('2d');
-            charts.trend = new Chart(ctxTrend, {
-                type: 'line',
-                data: {
-                    labels: sortedDates,
-                    datasets: [{
-                        label: 'Transactions',
-                        data: sortedDates.map(k => dateCounts[k]),
-                        borderColor: '#6366f1',
-                        backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                        borderWidth: 2,
-                        fill: true,
-                        tension: 0.3,
-                        pointBackgroundColor: '#6366f1'
-                    }]
-                },
-                options: {
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { legend: { display: false }, datalabels: { display: false } },
-                    scales: { y: { beginAtZero: true, grid: { borderDash: [2, 4], color: '#f1f5f9' } }, x: { grid: { display: false } } }
-                }
-            });
-
-            // Top Items Chart (Bar) - UPDATED: Colors, Max width and Long label truncation
-            const sortedItems = Object.entries(itemCounts).sort((a,b) => b[1] - a[1]).slice(0, 10);
-            const ctxTopItems = document.getElementById('chartTopItems').getContext('2d');
-            charts.topItems = new Chart(ctxTopItems, {
-                type: 'bar',
-                data: {
-                    labels: sortedItems.map(i => i[0].length > 25 ? i[0].substring(0,25)+'...' : i[0]),
-                    datasets: [{
-                        data: sortedItems.map(i => i[1]),
-                        backgroundColor: generateColors(sortedItems.length), // Use multiple colors
-                        borderRadius: 4,
-                        maxBarThickness: 40 // Prevent single items from looking too big
-                    }]
-                },
-                options: {
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { 
-                        legend: { display: false }, 
-                        datalabels: { anchor: 'end', align: 'top', color: '#64748b', font: {size: 10} }
-                    },
-                    scales: { 
-                        y: { beginAtZero: true, grid: { borderDash: [2, 4], color: '#f1f5f9' } }, 
-                        x: { grid: { display: false } } 
-                    }
-                }
-            });
-
-            // Pie
-            const ctxPrefix = document.getElementById('chartPrefix').getContext('2d');
-            charts.prefix = new Chart(ctxPrefix, {
-                type: 'doughnut',
-                data: {
-                    labels: ['Customer (C)', 'General (N)'],
-                    datasets: [{
-                        data: [prefixCounts['Cxxxx'], prefixCounts['Nxxxxx']],
-                        backgroundColor: [CHART_COLORS.C.bg, CHART_COLORS.N.bg],
-                        borderWidth: 0,
-                        hoverOffset: 4
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { position: 'bottom', labels: { padding: 20, usePointStyle: true } },
-                        datalabels: {
-                            color: '#fff',
-                            font: { weight: 'bold' },
-                            formatter: (value, ctx) => {
-                                let sum = 0; ctx.chart.data.datasets[0].data.forEach(d => sum+=d);
-                                if(sum===0) return "";
-                                return ((value*100)/sum).toFixed(0) + "%";
-                            }
-                        }
-                    },
-                    cutout: '70%'
-                }
-            });
-
-            // Bar To
-            const sortedTo = Object.entries(toCounts).sort((a,b) => b[1] - a[1]).slice(0, 10);
-            const ctxTopTo = document.getElementById('chartTopTo').getContext('2d');
-            charts.topTo = new Chart(ctxTopTo, {
-                type: 'bar',
-                data: {
-                    labels: sortedTo.map(i => i[0].length > 20 ? i[0].substring(0,20)+'...' : i[0]),
-                    datasets: [{
-                        data: sortedTo.map(i => i[1]),
-                        backgroundColor: generateColors(sortedTo.length),
-                        borderRadius: 6,
-                        barThickness: 24
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: { legend: { display: false }, datalabels: { anchor: 'end', align: 'top', color: '#64748b', font: {size: 11} } },
-                    scales: { y: { beginAtZero: true, grid: { borderDash: [2, 4], color: '#f1f5f9' } }, x: { grid: { display: false } } }
-                }
-            });
-
-            // Bar From
-            const fromLabels = Object.keys(fromCounts);
-            const fromData = Object.values(fromCounts);
-            const ctxFrom = document.getElementById('chartFrom').getContext('2d');
-            charts.from = new Chart(ctxFrom, {
-                type: 'bar',
-                data: {
-                    labels: fromLabels,
-                    datasets: [{
-                        data: fromData,
-                        backgroundColor: generateColors(fromLabels.length),
-                        hoverBackgroundColor: '#94a3b8',
-                        borderRadius: 4,
-                        barThickness: 'flex',
-                        maxBarThickness: 40
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: { legend: { display: false }, datalabels: { anchor: 'end', align: 'top', color: '#64748b' } },
-                    scales: { y: { display: false }, x: { grid: { display: false } } }
-                }
-            });
-        }
-
-        function renderTables() {
-            // Updated to use Modern UI classes in string generation
-            const tbodyMain = document.getElementById('summaryTableMain');
-            tbodyMain.innerHTML = '';
-            if (summaryMain.length === 0) {
-                tbodyMain.innerHTML = `<tr><td colspan="7" class="text-center py-8 text-slate-400 italic">No records found</td></tr>`;
-            } else {
-                summaryMain.forEach(row => {
-                    tbodyMain.innerHTML += `
-                        <tr class="table-row-hover transition border-b border-slate-50 last:border-0 group">
-                            <td class="px-6 py-4 font-medium text-slate-700">${row.ItemNo}</td>
-                            <td class="px-6 py-4 text-slate-500 truncate max-w-xs" title="${row.Description}">${row.Description}</td>
-                            <td class="px-6 py-4"><span class="font-mono text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-1 rounded">${row.FromSub}</span></td>
-                            <td class="px-6 py-4 text-slate-600 text-sm">${row.FromSubName}</td>
-                            <td class="px-6 py-4 text-right"><span class="font-bold text-blue-600">${row.Customer}</span></td>
-                            <td class="px-6 py-4 text-right"><span class="font-bold text-emerald-600">${row.Node}</span></td>
-                            <td class="px-6 py-4 text-right font-bold text-slate-800 text-lg">${row.total}</td>
-                        </tr>`;
-                });
-            }
-
-            const tbodyService = document.getElementById('summaryTableService');
-            tbodyService.innerHTML = '';
-            if (summaryService.length === 0) {
-                tbodyService.innerHTML = `<tr><td colspan="7" class="text-center py-8 text-slate-400 italic">No records found</td></tr>`;
-            } else {
-                summaryService.forEach(row => {
-                    tbodyService.innerHTML += `
-                        <tr class="table-row-hover transition border-b border-slate-50 last:border-0">
-                            <td class="px-6 py-4 font-medium text-slate-700">${row.ItemNo}</td>
-                            <td class="px-6 py-4 text-slate-500 truncate max-w-xs" title="${row.Description}">${row.Description}</td>
-                            <td class="px-6 py-4"><span class="font-mono text-xs font-bold text-rose-600 bg-rose-50 px-2 py-1 rounded">${row.FromSub}</span></td>
-                            <td class="px-6 py-4 text-slate-600 text-sm">${row.FromSubName}</td>
-                            <td class="px-6 py-4 text-right"><span class="font-bold text-blue-600">${row.Customer}</span></td>
-                            <td class="px-6 py-4 text-right"><span class="font-bold text-emerald-600">${row.Node}</span></td>
-                            <td class="px-6 py-4 text-right font-bold text-slate-800 text-lg">${row.total}</td>
-                        </tr>`;
-                });
-            }
-
-            const tbody = document.getElementById('tableBody');
-            const emptyMsg = document.getElementById('emptyTableMsg');
-            tbody.innerHTML = '';
-            if (filteredData.length === 0) { 
-                emptyMsg.classList.remove('hidden'); 
-            } else {
-                emptyMsg.classList.add('hidden');
-                const displayData = filteredData.slice(0, 500); 
-                displayData.forEach(row => {
-                    let badgeClass = row.ToSubType === 'Cxxxx' 
-                        ? 'bg-blue-50 text-blue-700 border border-blue-100' 
-                        : 'bg-emerald-50 text-emerald-700 border border-emerald-100';
-                    
-                    tbody.innerHTML += `
-                        <tr class="table-row-hover transition border-b border-slate-50 last:border-0">
-                            <td class="px-6 py-3 text-slate-600 text-xs font-mono whitespace-nowrap">${row.DateDisplay}</td>
-                            <td class="px-6 py-3 font-medium text-slate-700 whitespace-nowrap">${row.ItemNo}</td>
-                            <td class="px-6 py-3 text-slate-500 text-xs">${row.Description}</td>
-                            <td class="px-6 py-3"><span class="font-mono text-xs text-indigo-900 bg-indigo-50/50 px-1.5 py-0.5 rounded">${row.FromSub}</span></td>
-                            <td class="px-6 py-3 text-slate-600 text-xs">${row.FromSubName}</td>
-                            <td class="px-6 py-3"><span class="font-mono text-xs text-emerald-900 bg-emerald-50/50 px-1.5 py-0.5 rounded">${row.ToSub}</span></td>
-                            <td class="px-6 py-3 text-slate-600 text-xs">${row.ToSubName}</td>
-                            <td class="px-6 py-3"><span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide ${badgeClass}">${row.ToSubType}</span></td>
-                        </tr>`;
-                });
-                if(filteredData.length > 500) {
-                    tbody.innerHTML += `<tr><td colspan="7" class="text-center py-4 text-xs text-slate-400 bg-slate-50">Showing first 500 rows of ${filteredData.length.toLocaleString()}</td></tr>`;
-                }
-            }
-        }
-
-        function initFilters() {
-            Object.keys(activeFilters).forEach(id => {
-                let uniqueValues = [...new Set(allValidData.map(d => d[activeFilters[id].field]))];
-                
-                // Sort Date differently (Chronologically)
-                if(id === 'filter-date') {
-                    uniqueValues.sort((a, b) => {
-                        // Attempt to parse back DD/MM/YYYY to Date object for sorting
-                        if(a === '-') return 1;
-                        if(b === '-') return -1;
-                        const partsA = a.split('/');
-                        const partsB = b.split('/');
-                        const dateA = new Date(partsA[2], partsA[1]-1, partsA[0]);
-                        const dateB = new Date(partsB[2], partsB[1]-1, partsB[0]);
-                        return dateA - dateB;
-                    });
-                } else {
-                    uniqueValues.sort();
-                }
-
-                const container = document.getElementById(id);
-                let html = `
-                    <div class="flex justify-between border-b border-slate-100 pb-2 mb-2 p-2 sticky top-0 bg-white z-10">
-                        <button onclick="setFilterState('${id}', true)" class="text-xs font-bold text-indigo-600 hover:text-indigo-800">Select All</button>
-                        <button onclick="setFilterState('${id}', false)" class="text-xs text-slate-400 hover:text-slate-600">Clear</button>
-                    </div>
-                    <div class="space-y-1 max-h-48 overflow-y-auto p-2 custom-scrollbar">`;
-                uniqueValues.forEach(val => {
-                    html += `<label class="flex items-center space-x-2 text-xs cursor-pointer hover:bg-slate-50 p-2 rounded-md transition-colors">
-                        <input type="checkbox" value="${val}" class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 filter-cb-${id}">
-                        <span class="truncate text-slate-600 leading-tight">${val || '<em class="text-slate-300">Empty</em>'}</span>
-                    </label>`;
-                });
-                html += `</div>
-                    <div class="mt-2 pt-2 border-t border-slate-100 p-2 sticky bottom-0 bg-white z-10">
-                        <button onclick="applyFilters('${id}')" class="bg-indigo-600 text-white text-xs font-bold px-3 py-2 rounded-lg hover:bg-indigo-700 w-full shadow-sm transition-all active:scale-95">Apply Filter</button>
-                    </div>`;
-                container.innerHTML = html;
-            });
-        }
-
-        function toggleFilter(id) {
-            document.querySelectorAll('.filter-dropdown').forEach(e => { if(e.id !== id) e.classList.remove('show'); });
-            document.getElementById(id).classList.toggle('show');
-        }
-        function setFilterState(id, checked) {
-            document.querySelectorAll(`.filter-cb-${id}`).forEach(cb => cb.checked = checked);
-        }
-        function applyFilters(triggerId) {
-            document.getElementById(triggerId).classList.remove('show');
-            Object.keys(activeFilters).forEach(id => {
-                const cbs = document.querySelectorAll(`.filter-cb-${id}:checked`);
-                activeFilters[id].selected = Array.from(cbs).map(cb => cb.value);
-            });
-            runPipeline();
-        }
-        window.onclick = e => {
-            if(!e.target.closest('th')) document.querySelectorAll('.filter-dropdown').forEach(el => el.classList.remove('show'));
-        };
-
-        function exportIgnoredData() {
-            if (ignoredData.length === 0) return;
-            const wb = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ignoredData), "Ignored_Data");
-            XLSX.writeFile(wb, "Ignored_Data_Log.xlsx");
-        }
-
-        function exportAll() {
-            if (filteredData.length === 0) return;
-            const wb = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryMain), "Summary_Main");
-            XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryService), "Summary_ServiceDefect");
-            XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filteredData), "All_Filtered_Data");
-            XLSX.writeFile(wb, "Stock_Analysis_Report_All.xlsx");
-        }
-        function exportSingleSheet(type) {
-            if (filteredData.length === 0) return;
-            const wb = XLSX.utils.book_new();
-            if (type === 'main') {
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryMain), "Summary_Main");
-                XLSX.writeFile(wb, "Summary_Main_Stock.xlsx");
-            } else if (type === 'service') {
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryService), "Summary_Service");
-                XLSX.writeFile(wb, "Summary_Service_Stock.xlsx");
-            } else if (type === 'detail') {
-                XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filteredData), "Detail_Data");
-                XLSX.writeFile(wb, "Filtered_Detail_Data.xlsx");
-            }
-        }
-    </script>
-</body>
-</html>
+  );
+}
