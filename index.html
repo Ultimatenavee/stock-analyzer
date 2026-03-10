@@ -568,7 +568,8 @@
                     const rowStr = rows[i].map(x => String(x).toLowerCase()).join(" ");
                     // Flexible detection criteria
                     if((rowStr.includes("from") && rowStr.includes("sub")) || 
-                       (rowStr.includes("item") && rowStr.includes("no"))) {
+                       (rowStr.includes("item") && rowStr.includes("no")) ||
+                       rowStr.includes("รหัสสินค้า")) {
                         headerRowIndex = i;
                         foundHeaders = rows[i];
                         break;
@@ -587,17 +588,14 @@
                 
                 const headers = Object.keys(jsonData[0]);
                 
-                // 3. Robust Column Mapping (UPDATED Logic for Col K/Index 10)
-                // Note: foundHeaders contains the header strings. foundHeaders[10] is the 11th column (K).
-                // We prioritize looking at index 10 for the date.
+                // 3. Robust Column Mapping (UPDATED Logic to prevent grouping errors)
                 const colKHeader = (foundHeaders && foundHeaders.length > 10) ? foundHeaders[10] : null;
 
                 const keyMap = {
-                    itemNo: headers.find(h => /item.*no/i.test(h)) || headers[0],
-                    desc: headers.find(h => /desc/i.test(h)) || headers[1],
-                    fromSub: headers.find(h => /from.*sub/i.test(h)),
-                    toSub: headers.find(h => /to.*sub/i.test(h)),
-                    // Force Column K if available, otherwise search regex
+                    itemNo: headers.find(h => /(item.*no|รหัส|part|mat)/i.test(h)) || headers[0],
+                    desc: headers.find(h => /(desc|name|detail|ชื่อ|รายละเอียด)/i.test(h)) || headers[1],
+                    fromSub: headers.find(h => /(from.*sub|ต้นทาง)/i.test(h)),
+                    toSub: headers.find(h => /(to.*sub|ปลายทาง)/i.test(h)),
                     date: colKHeader ? colKHeader : headers.find(h => /(date|time|day|วัน|doc.*date|post.*date|dct|d\/m\/y|create|timestamp)/i.test(h))
                 };
                 
@@ -838,7 +836,9 @@
                 }
 
                 if(d.ItemNo) {
-                    itemCounts[d.ItemNo] = (itemCounts[d.ItemNo] || 0) + 1;
+                    // Combine ItemNo and Description for clearer chart labels
+                    const itemName = d.Description && d.Description !== d.ItemNo ? `${d.ItemNo} - ${d.Description}` : d.ItemNo;
+                    itemCounts[itemName] = (itemCounts[itemName] || 0) + 1;
                 }
             });
 
@@ -871,23 +871,30 @@
                 }
             });
 
-            // Top Items Chart (Bar)
+            // Top Items Chart (Bar) - UPDATED: Colors, Max width and Long label truncation
             const sortedItems = Object.entries(itemCounts).sort((a,b) => b[1] - a[1]).slice(0, 10);
             const ctxTopItems = document.getElementById('chartTopItems').getContext('2d');
             charts.topItems = new Chart(ctxTopItems, {
                 type: 'bar',
                 data: {
-                    labels: sortedItems.map(i => i[0]),
+                    labels: sortedItems.map(i => i[0].length > 25 ? i[0].substring(0,25)+'...' : i[0]),
                     datasets: [{
                         data: sortedItems.map(i => i[1]),
-                        backgroundColor: '#8b5cf6',
-                        borderRadius: 4
+                        backgroundColor: generateColors(sortedItems.length), // Use multiple colors
+                        borderRadius: 4,
+                        maxBarThickness: 40 // Prevent single items from looking too big
                     }]
                 },
                 options: {
                     responsive: true, maintainAspectRatio: false,
-                    plugins: { legend: { display: false }, datalabels: { anchor: 'end', align: 'top', color: '#64748b', font: {size: 10} } },
-                    scales: { y: { beginAtZero: true, grid: { borderDash: [2, 4], color: '#f1f5f9' } }, x: { grid: { display: false } } }
+                    plugins: { 
+                        legend: { display: false }, 
+                        datalabels: { anchor: 'end', align: 'top', color: '#64748b', font: {size: 10} }
+                    },
+                    scales: { 
+                        y: { beginAtZero: true, grid: { borderDash: [2, 4], color: '#f1f5f9' } }, 
+                        x: { grid: { display: false } } 
+                    }
                 }
             });
 
@@ -1133,5 +1140,4 @@
         }
     </script>
 </body>
-
 </html>
